@@ -30,9 +30,9 @@ spec:
       - name: namespace
         value: openshift-pipelines
     params:
-    - name: url
+    - name: URL
       value: $(params.git-url)
-    - name: revision
+    - name: REVISION
       value: $(params.git-revision)
     workspaces:
     - name: output
@@ -58,7 +58,7 @@ spec:
     workspaces:
     - name: source
       workspace: shared-workspace
-    - name: maven-settings
+    - name: maven_settings
       workspace: maven-settings
 
   - name: copy-dockerfile
