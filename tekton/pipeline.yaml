@@ -1,0 +1,83 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: petclinic-build
+  namespace: petclinic
+spec:
+  params:
+  - name: git-url
+    type: string
+    default: https://github.com/spring-projects/spring-petclinic.git
+  - name: git-revision
+    type: string
+    default: main
+  - name: image
+    type: string
+    default: image-registry.openshift-image-registry.svc:5000/petclinic/petclinic:latest
+  workspaces:
+  - name: shared-workspace
+  - name: maven-settings
+  - name: dockerfile
+  tasks:
+  - name: fetch-source
+    taskRef:
+      name: git-clone
+      kind: ClusterTask
+    params:
+    - name: url
+      value: $(params.git-url)
+    - name: revision
+      value: $(params.git-revision)
+    workspaces:
+    - name: output
+      workspace: shared-workspace
+
+  - name: build-app
+    taskRef:
+      name: maven
+      kind: ClusterTask
+    runAfter:
+    - fetch-source
+    params:
+    - name: GOALS
+      value:
+      - package
+      - -DskipTests
+    workspaces:
+    - name: source
+      workspace: shared-workspace
+    - name: maven-settings
+      workspace: maven-settings
+
+  - name: copy-dockerfile
+    runAfter:
+    - build-app
+    taskSpec:
+      workspaces:
+      - name: source
+      - name: dockerfile
+      steps:
+      - name: copy
+        image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+        script: |
+          cp $(workspaces.dockerfile.path)/Dockerfile $(workspaces.source.path)/Dockerfile
+    workspaces:
+    - name: source
+      workspace: shared-workspace
+    - name: dockerfile
+      workspace: dockerfile
+
+  - name: build-image
+    taskRef:
+      name: buildah
+      kind: ClusterTask
+    runAfter:
+    - copy-dockerfile
+    params:
+    - name: IMAGE
+      value: $(params.image)
+    - name: DOCKERFILE
+      value: ./Dockerfile
+    workspaces:
+    - name: source
+      workspace: shared-workspace

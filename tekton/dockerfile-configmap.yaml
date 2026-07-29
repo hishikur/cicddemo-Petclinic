@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: petclinic-dockerfile
+  namespace: petclinic
+data:
+  Dockerfile: |
+    FROM registry.access.redhat.com/ubi9/openjdk-17:latest
+    COPY target/*.jar /deployments/app.jar
+    EXPOSE 8080
+    ENTRYPOINT ["java", "-jar", "/deployments/app.jar"]

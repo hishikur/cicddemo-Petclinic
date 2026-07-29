@@ -1,0 +1,29 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: petclinic-build-
+  namespace: petclinic
+spec:
+  pipelineRef:
+    name: petclinic-build
+  params:
+  - name: git-url
+    value: https://github.com/spring-projects/spring-petclinic.git
+  - name: git-revision
+    value: main
+  - name: image
+    value: image-registry.openshift-image-registry.svc:5000/petclinic/petclinic:latest
+  workspaces:
+  - name: shared-workspace
+    volumeClaimTemplate:
+      spec:
+        accessModes:
+        - ReadWriteOnce
+        resources:
+          requests:
+            storage: 2Gi
+  - name: maven-settings
+    emptyDir: {}
+  - name: dockerfile
+    configMap:
+      name: petclinic-dockerfile
