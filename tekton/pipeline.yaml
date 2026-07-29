@@ -21,8 +21,14 @@ spec:
   tasks:
   - name: fetch-source
     taskRef:
-      name: git-clone
-      kind: ClusterTask
+      resolver: cluster
+      params:
+      - name: kind
+        value: task
+      - name: name
+        value: git-clone
+      - name: namespace
+        value: openshift-pipelines
     params:
     - name: url
       value: $(params.git-url)
@@ -34,8 +40,14 @@ spec:
 
   - name: build-app
     taskRef:
-      name: maven
-      kind: ClusterTask
+      resolver: cluster
+      params:
+      - name: kind
+        value: task
+      - name: name
+        value: maven
+      - name: namespace
+        value: openshift-pipelines
     runAfter:
     - fetch-source
     params:
@@ -69,8 +81,14 @@ spec:
 
   - name: build-image
     taskRef:
-      name: buildah
-      kind: ClusterTask
+      resolver: cluster
+      params:
+      - name: kind
+        value: task
+      - name: name
+        value: buildah
+      - name: namespace
+        value: openshift-pipelines
     runAfter:
     - copy-dockerfile
     params:
