@@ -19,6 +19,8 @@ spec:
   - name: maven-settings
   - name: dockerfile
   tasks:
+
+  # ========== 1. ソースコード取得 ==========
   - name: fetch-source
     taskRef:
       resolver: cluster
@@ -38,7 +40,8 @@ spec:
     - name: output
       workspace: shared-workspace
 
-  - name: build-app
+  # ========== 2. 単体テスト (JUnit) ==========
+  - name: unit-test
     taskRef:
       resolver: cluster
       params:
@@ -53,6 +56,56 @@ spec:
     params:
     - name: GOALS
       value:
+      - test
+    workspaces:
+    - name: source
+      workspace: shared-workspace
+    - name: maven_settings
+      workspace: maven-settings
+
+  # ========== 3. コード品質チェック (Checkstyle) ==========
+  - name: code-analysis
+    runAfter:
+    - unit-test
+    taskSpec:
+      workspaces:
+      - name: source
+      steps:
+      - name: checkstyle
+        image: registry.access.redhat.com/ubi9/openjdk-17:latest
+        workingDir: $(workspaces.source.path)
+        script: |
+          #!/bin/bash
+          echo "=== Checkstyle Analysis ==="
+          ./mvnw checkstyle:check -q 2>&1 || true
+          echo ""
+          echo "=== Compiler Warnings Check ==="
+          ./mvnw compile -Xlint:all -q 2>&1 | grep -c "warning" || echo "0 warnings"
+          echo ""
+          echo "=== Dependency Tree (security-relevant) ==="
+          ./mvnw dependency:tree -q 2>&1 | grep -E "(spring-security|log4j|jackson)" | head -10
+          echo ""
+          echo "Code analysis completed."
+    workspaces:
+    - name: source
+      workspace: shared-workspace
+
+  # ========== 4. アプリケーションビルド ==========
+  - name: build-app
+    taskRef:
+      resolver: cluster
+      params:
+      - name: kind
+        value: task
+      - name: name
+        value: maven
+      - name: namespace
+        value: openshift-pipelines
+    runAfter:
+    - code-analysis
+    params:
+    - name: GOALS
+      value:
       - package
       - -DskipTests
     workspaces:
@@ -61,6 +114,7 @@ spec:
     - name: maven_settings
       workspace: maven-settings
 
+  # ========== 5. Dockerfile 配置 ==========
   - name: copy-dockerfile
     runAfter:
     - build-app
@@ -73,12 +127,15 @@ spec:
         image: registry.access.redhat.com/ubi9/ubi-minimal:latest
         script: |
           cp $(workspaces.dockerfile.path)/Dockerfile $(workspaces.source.path)/Dockerfile
+          echo "Dockerfile copied."
+          cat $(workspaces.source.path)/Dockerfile
     workspaces:
     - name: source
       workspace: shared-workspace
     - name: dockerfile
       workspace: dockerfile
 
+  # ========== 6. コンテナイメージビルド ==========
   - name: build-image
     taskRef:
       resolver: cluster
@@ -99,3 +156,208 @@ spec:
     workspaces:
     - name: source
       workspace: shared-workspace
+
+  # ========== 7. イメージ脆弱性スキャン (Trivy) ==========
+  - name: image-scan
+    runAfter:
+    - build-image
+    taskSpec:
+      params:
+      - name: image
+        type: string
+      steps:
+      - name: scan
+        image: aquasec/trivy:latest
+        script: |
+          #!/bin/sh
+          echo "=== Container Image Vulnerability Scan ==="
+          echo "Target: $(params.image)"
+          echo ""
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --exit-code 0 \
+            --no-progress \
+            --insecure \
+            --timeout 5m \
+            $(params.image) 2>&1 || echo "Scan completed with warnings"
+          echo ""
+          echo "=== Scan Summary ==="
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --exit-code 0 \
+            --no-progress \
+            --insecure \
+            --timeout 5m \
+            --format json \
+            $(params.image) 2>/dev/null | \
+            grep -o '"Severity":"[^"]*"' | sort | uniq -c || echo "Summary not available"
+    params:
+    - name: image
+      value: $(params.image)
+
+  # ========== 8. デプロイ完了待ち ==========
+  - name: deploy-wait
+    runAfter:
+    - image-scan
+    taskRef:
+      resolver: cluster
+      params:
+      - name: kind
+        value: task
+      - name: name
+        value: openshift-client
+      - name: namespace
+        value: openshift-pipelines
+    params:
+    - name: SCRIPT
+      value: |
+        echo "=== Restarting deployment to pick up new image ==="
+        oc rollout restart deployment/petclinic -n petclinic
+        echo "=== Waiting for rollout ==="
+        oc rollout status deployment/petclinic -n petclinic --timeout=120s
+        echo "=== Pod Status ==="
+        oc get pods -n petclinic -l app=petclinic
+
+  # ========== 9. スモークテスト (HTTP 200 チェック) ==========
+  - name: smoke-test
+    runAfter:
+    - deploy-wait
+    taskSpec:
+      steps:
+      - name: test
+        image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+        script: |
+          #!/bin/bash
+          echo "=== Smoke Test ==="
+          ROUTE="http://petclinic.petclinic.svc:8080"
+          RETRIES=10
+          for i in $(seq 1 $RETRIES); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$ROUTE/" 2>/dev/null)
+            if [ "$CODE" = "200" ]; then
+              echo "PASS: GET / returned HTTP $CODE"
+              exit 0
+            fi
+            echo "Attempt $i/$RETRIES: HTTP $CODE (waiting...)"
+            sleep 5
+          done
+          echo "FAIL: Application not responding with 200 after $RETRIES attempts"
+          exit 1
+
+  # ========== 10. APIテスト (エンドポイント検証) ==========
+  - name: api-test
+    runAfter:
+    - smoke-test
+    taskSpec:
+      steps:
+      - name: test
+        image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+        script: |
+          #!/bin/bash
+          ROUTE="http://petclinic.petclinic.svc:8080"
+          PASS=0
+          FAIL=0
+
+          check() {
+            local name="$1" url="$2" expect="$3"
+            BODY=$(curl -s "$url" 2>/dev/null)
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$url" 2>/dev/null)
+            if [ "$CODE" = "200" ] && echo "$BODY" | grep -q "$expect"; then
+              echo "PASS: $name (HTTP $CODE, contains '$expect')"
+              PASS=$((PASS + 1))
+            else
+              echo "FAIL: $name (HTTP $CODE)"
+              FAIL=$((FAIL + 1))
+            fi
+          }
+
+          echo "=== API Endpoint Tests ==="
+          echo ""
+          check "Home Page"       "$ROUTE/"              "Welcome"
+          check "Find Owners"     "$ROUTE/owners/find"   "Find Owners"
+          check "Vets Page"       "$ROUTE/vets.html"     "Veterinarians"
+          check "Error Handling"  "$ROUTE/oups"          "something happened"
+          echo ""
+          echo "=== Results: $PASS passed, $FAIL failed ==="
+
+          if [ "$FAIL" -gt 0 ]; then
+            exit 1
+          fi
+
+  # ========== 11. 負荷テスト (簡易パフォーマンス) ==========
+  - name: load-test
+    runAfter:
+    - api-test
+    taskSpec:
+      steps:
+      - name: test
+        image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+        script: |
+          #!/bin/bash
+          ROUTE="http://petclinic.petclinic.svc:8080"
+          REQUESTS=50
+          CONCURRENT=5
+
+          echo "=== Load Test ==="
+          echo "Target: $ROUTE"
+          echo "Requests: $REQUESTS (${CONCURRENT} concurrent)"
+          echo ""
+
+          TOTAL_TIME=0
+          SUCCESS=0
+          ERRORS=0
+
+          run_batch() {
+            for j in $(seq 1 $CONCURRENT); do
+              (
+                START=$(date +%s%N)
+                CODE=$(curl -s -o /dev/null -w "%{http_code}" "$ROUTE/" 2>/dev/null)
+                END=$(date +%s%N)
+                MS=$(( (END - START) / 1000000 ))
+                echo "$CODE $MS"
+              ) &
+            done
+            wait
+          }
+
+          OVERALL_START=$(date +%s)
+
+          for i in $(seq 1 $((REQUESTS / CONCURRENT))); do
+            RESULTS=$(run_batch)
+            while IFS= read -r line; do
+              CODE=$(echo "$line" | cut -d' ' -f1)
+              MS=$(echo "$line" | cut -d' ' -f2)
+              if [ "$CODE" = "200" ]; then
+                SUCCESS=$((SUCCESS + 1))
+              else
+                ERRORS=$((ERRORS + 1))
+              fi
+              TOTAL_TIME=$((TOTAL_TIME + MS))
+            done <<< "$RESULTS"
+          done
+
+          OVERALL_END=$(date +%s)
+          ELAPSED=$((OVERALL_END - OVERALL_START))
+          if [ "$SUCCESS" -gt 0 ]; then
+            AVG=$((TOTAL_TIME / SUCCESS))
+          else
+            AVG=0
+          fi
+          if [ "$ELAPSED" -gt 0 ]; then
+            RPS=$((SUCCESS / ELAPSED))
+          else
+            RPS=$SUCCESS
+          fi
+
+          echo "=== Results ==="
+          echo "Total requests:    $((SUCCESS + ERRORS))"
+          echo "Successful:        $SUCCESS"
+          echo "Errors:            $ERRORS"
+          echo "Avg response time: ${AVG}ms"
+          echo "Throughput:        ~${RPS} req/s"
+          echo "Total time:        ${ELAPSED}s"
+          echo ""
+          if [ "$ERRORS" -gt $((REQUESTS / 5)) ]; then
+            echo "FAIL: Error rate too high (>20%)"
+            exit 1
+          fi
+          echo "PASS: Load test completed within acceptable limits"
