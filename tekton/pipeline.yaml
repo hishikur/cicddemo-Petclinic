@@ -275,7 +275,7 @@ spec:
           check "Home Page"       "$ROUTE/"              "Welcome"
           check "Find Owners"     "$ROUTE/owners/find"   "Find Owners"
           check "Vets Page"       "$ROUTE/vets.html"     "Veterinarians"
-          check "Error Handling"  "$ROUTE/oups"          "something happened"
+          check "New Owner Form"  "$ROUTE/owners/new"    "New Owner"
           echo ""
           echo "=== Results: $PASS passed, $FAIL failed ==="
 
