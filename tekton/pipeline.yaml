@@ -21,6 +21,10 @@ spec:
   tasks:
 
   # ========== 1. ソースコード取得 ==========
+  # OpenShift Pipelines 標準の git-clone ClusterTask を使用し、
+  # GitHub 上の Spring PetClinic リポジトリを shared-workspace にクローンする。
+  # パラメータの git-url / git-revision はデフォルト値を持つが、
+  # PipelineRun から上書き可能。
   - name: fetch-source
     taskRef:
       resolver: cluster
@@ -41,6 +45,10 @@ spec:
       workspace: shared-workspace
 
   # ========== 2. 単体テスト (JUnit) ==========
+  # Maven の `test` ゴールを実行し、src/test 配下の JUnit テストを実行する。
+  # テスト失敗時はパイプライン全体が停止するため、
+  # 品質の低いコードがビルド・デプロイされるのを防ぐゲートとなる。
+  # maven_settings ワークスペースは emptyDir (デフォルト設定を使用)。
   - name: unit-test
     taskRef:
       resolver: cluster
@@ -64,6 +72,12 @@ spec:
       workspace: maven-settings
 
   # ========== 3. コード品質チェック (Checkstyle) ==========
+  # インライン TaskSpec で3種類の静的解析を実行する:
+  #   1. Checkstyle: コーディング規約違反をチェック (違反があっても続行: || true)
+  #   2. Compiler Warnings: -Xlint:all で全カテゴリの警告を検出し件数を表示
+  #   3. Dependency Tree: セキュリティ関連の依存 (spring-security, log4j, jackson) を抽出
+  # ClusterTask ではなく taskSpec を使用しているため、このパイプライン内で完結する。
+  # UBI9 + OpenJDK 17 イメージで Maven Wrapper (./mvnw) を直接実行する。
   - name: code-analysis
     runAfter:
     - unit-test
@@ -91,6 +105,10 @@ spec:
       workspace: shared-workspace
 
   # ========== 4. アプリケーションビルド ==========
+  # Maven の `package` ゴールで JAR ファイルを生成する。
+  # -DskipTests を指定し、ステップ2で実行済みのテストを再実行しない。
+  # 生成物 (target/*.jar) は shared-workspace に残り、
+  # 後続の build-image ステップで Dockerfile の COPY 対象となる。
   - name: build-app
     taskRef:
       resolver: cluster
@@ -115,6 +133,11 @@ spec:
       workspace: maven-settings
 
   # ========== 5. Dockerfile 配置 ==========
+  # ConfigMap (petclinic-dockerfile) に格納された Dockerfile を
+  # shared-workspace のルートにコピーする。
+  # Dockerfile はリポジトリに含まれていないため、ConfigMap 経由で注入する方式。
+  # これにより Dockerfile の管理をクラスタ側で行える
+  # (アプリケーションリポジトリを変更せずにビルド設定を変更可能)。
   - name: copy-dockerfile
     runAfter:
     - build-app
@@ -136,6 +159,11 @@ spec:
       workspace: dockerfile
 
   # ========== 6. コンテナイメージビルド ==========
+  # OpenShift Pipelines 標準の Buildah ClusterTask でコンテナイメージをビルド & Push。
+  # Buildah は Docker デーモン不要で OCI イメージを作成できる (rootless 対応)。
+  # ビルドしたイメージは OpenShift 内部レジストリ
+  # (image-registry.openshift-image-registry.svc:5000) に Push される。
+  # Dockerfile はステップ5で配置済みのものを使用。
   - name: build-image
     taskRef:
       resolver: cluster
@@ -158,6 +186,12 @@ spec:
       workspace: shared-workspace
 
   # ========== 7. イメージ脆弱性スキャン (Trivy) ==========
+  # Aqua Security の Trivy でビルド済みイメージの脆弱性をスキャンする。
+  # HIGH / CRITICAL レベルのみを対象とし、結果をテーブル形式 + JSON サマリで出力。
+  # --exit-code 0: 脆弱性が見つかってもパイプラインを止めない (デモ用途のため)。
+  #   本番運用では --exit-code 1 にして CRITICAL 検出時にブロックすることを推奨。
+  # --insecure: OpenShift 内部レジストリは自己署名証明書のため TLS 検証をスキップ。
+  # スキャンは2回実行: 1回目はテーブル表示、2回目は JSON から重大度別の件数を集計。
   - name: image-scan
     runAfter:
     - build-image
@@ -196,6 +230,12 @@ spec:
       value: $(params.image)
 
   # ========== 8. デプロイ完了待ち ==========
+  # openshift-client ClusterTask で oc コマンドを実行し、デプロイを更新する。
+  # イメージタグが :latest で固定のため、rollout restart で強制的に再Pull させる。
+  # rollout status で新しい Pod が Ready になるまで最大120秒待機し、
+  # 完了後に Pod の状態を表示して正常起動を確認する。
+  # 後続のテストステップ (smoke-test, api-test, load-test) が
+  # 新しいイメージに対して実行されることを保証する。
   - name: deploy-wait
     runAfter:
     - image-scan
@@ -219,6 +259,11 @@ spec:
         oc get pods -n petclinic -l app=petclinic
 
   # ========== 9. スモークテスト (HTTP 200 チェック) ==========
+  # デプロイされたアプリケーションが正常に起動しているかを最小限のチェックで確認する。
+  # クラスタ内部の Service エンドポイント (petclinic.petclinic.svc:8080) に
+  # curl でアクセスし、HTTP 200 が返るまで最大10回 (5秒間隔) リトライする。
+  # Spring Boot の起動に時間がかかるため、リトライ付きで待機する設計。
+  # ここで失敗すると後続の api-test / load-test は実行されない。
   - name: smoke-test
     runAfter:
     - deploy-wait
@@ -244,6 +289,13 @@ spec:
           exit 1
 
   # ========== 10. APIテスト (エンドポイント検証) ==========
+  # PetClinic の主要4エンドポイントに対して機能テストを実行する。
+  # 各エンドポイントで HTTP 200 + レスポンスボディに期待文字列が含まれるかを検証:
+  #   /              → "Welcome"      (トップページ)
+  #   /owners/find   → "Find Owners"  (オーナー検索画面)
+  #   /vets.html     → "Veterinarians"(獣医師一覧)
+  #   /owners/new    → "Add Owner"    (オーナー登録フォーム)
+  # check() 関数でテスト結果を PASS/FAIL で集計し、1件でも FAIL があれば exit 1。
   - name: api-test
     runAfter:
     - smoke-test
@@ -284,6 +336,14 @@ spec:
           fi
 
   # ========== 11. 負荷テスト (簡易パフォーマンス) ==========
+  # curl ベースの簡易負荷テストを実行する (外部ツール不要)。
+  # 50リクエストを5並列で発行し、以下のメトリクスを計測:
+  #   - 成功数 / エラー数
+  #   - 平均レスポンスタイム (ms)
+  #   - スループット (req/s)
+  # エラー率が20%を超えた場合にパイプラインを失敗させる。
+  # run_batch() でバックグラウンドプロセスを5つ起動し、wait で同期する方式。
+  # date +%s%N でナノ秒精度のタイムスタンプを取得してレスポンスタイムを計算。
   - name: load-test
     runAfter:
     - api-test
